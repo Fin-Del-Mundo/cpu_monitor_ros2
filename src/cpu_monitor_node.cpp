@@ -196,115 +196,141 @@ private:
         return allowed_cpus_.find(cpu_num) != allowed_cpus_.end();
     }
     
-    // 获取运行中的CPU核心的平均温度（排除低使用率和离线的核心）
-    float get_average_cpu_temperature() {
-        std::vector<float> valid_temperatures;
-        
-        // 从 /sys/class/thermal 读取温度信息
-        std::string thermal_path = "/sys/class/thermal";
+    // 从 /sys/class/hwmon 读取 coretemp 驱动的 CPU 核心温度
+    std::map<std::string, float> get_core_temperatures() {
+        std::map<std::string, float> core_temps;
+        std::string hwmon_base = "/sys/class/hwmon";
         
         try {
-            if (fs::exists(thermal_path)) {
-                for (const auto& entry : fs::directory_iterator(thermal_path)) {
-                    if (entry.is_directory()) {
-                        std::string zone_name = entry.path().filename().string();
+            if (fs::exists(hwmon_base)) {
+                // 遍历所有 hwmon 目录
+                for (const auto& hwmon_entry : fs::directory_iterator(hwmon_base)) {
+                    if (!hwmon_entry.is_directory()) continue;
+                    
+                    std::string hwmon_dir = hwmon_entry.path().string();
+                    std::string name_file = hwmon_dir + "/name";
+                    
+                    // 检查驱动名称是否为 coretemp
+                    if (fs::exists(name_file)) {
+                        std::ifstream name_stream(name_file);
+                        std::string driver_name;
                         
-                        // 检查是否是 thermal_zone 目录
-                        if (zone_name.find("thermal_zone") != std::string::npos) {
-                            // 读取温度文件
-                            std::string temp_file = entry.path().string() + "/temp";
+                        if (std::getline(name_stream, driver_name)) {
+                            // 去除末尾的换行符
+                            driver_name.erase(driver_name.find_last_not_of(" \n\r\t") + 1);
                             
-                            if (fs::exists(temp_file)) {
-                                std::ifstream temp_stream(temp_file);
-                                int32_t temp_raw = 0;
-                                
-                                if (temp_stream >> temp_raw) {
-                                    // 温度通常以毫度为单位，转换为摄氏度
-                                    int32_t temp_celsius = temp_raw / 1000;
+                            if (driver_name == "coretemp") {
+                                // 找该目录下所有的温度标签文件
+                                for (const auto& temp_entry : fs::directory_iterator(hwmon_dir)) {
+                                    std::string entry_name = temp_entry.path().filename().string();
                                     
-                                    // 尝试关联到具体的 CPU 核心
-                                    std::string type_file = entry.path().string() + "/type";
-                                    std::string cpu_type = "";
-                                    
-                                    if (fs::exists(type_file)) {
-                                        std::ifstream type_stream(type_file);
-                                        std::getline(type_stream, cpu_type);
-                                        type_stream.close();
-                                    }
-                                    
-                                    // 检查该核心是否应该被计入（在允许列表中，且使用率充分）
-                                    bool should_include = true;
-                                    
-                                    // 如果能识别具体的 CPU 核心，进行亲和性和使用率检查
-                                    if (cpu_type.find("Package") == std::string::npos &&
-                                        cpu_type.find("Platform") == std::string::npos) {
-                                        // 这是核心级的温度
-                                        // 尝试从 thermal_zone 名称中推断 CPU 编号
-                                        int zone_num = std::stoi(zone_name.substr(12));
-                                        std::string cpu_name = "cpu" + std::to_string(zone_num);
+                                    // 查找 temp*_label 文件
+                                    if (entry_name.find("temp") == 0 && 
+                                        entry_name.find("_label") != std::string::npos) {
                                         
-                                        // 检查 CPU 是否在亲和性列表中
-                                        if (!is_cpu_allowed(zone_num)) {
-                                            should_include = false;
-                                            RCLCPP_DEBUG(this->get_logger(), 
-                                                       "Skipping CPU not in affinity list: %s", cpu_name.c_str());
-                                        } else {
-                                            // 检查 CPU 使用率
-                                            double usage = calculate_cpu_usage(cpu_name);
-                                            if (usage < cpu_usage_threshold_) {
-                                                should_include = false;
-                                                RCLCPP_DEBUG(this->get_logger(), 
-                                                           "Skipping low-usage CPU %s (%.1f%%)", 
-                                                           cpu_name.c_str(), usage);
+                                        std::string label_file = temp_entry.path().string();
+                                        
+                                        // 读取标签名
+                                        std::ifstream label_stream(label_file);
+                                        std::string label;
+                                        
+                                        if (std::getline(label_stream, label)) {
+                                            // 去除末尾的换行符
+                                            label.erase(label.find_last_not_of(" \n\r\t") + 1);
+                                            
+                                            // 构造对应的 _input 文件名
+                                            std::string input_file = label_file;
+                                            size_t label_pos = input_file.find("_label");
+                                            if (label_pos != std::string::npos) {
+                                                input_file.replace(label_pos, 6, "_input");
+                                                
+                                                // 读取温度值
+                                                if (fs::exists(input_file)) {
+                                                    std::ifstream input_stream(input_file);
+                                                    int64_t raw_temp = 0;
+                                                    
+                                                    if (input_stream >> raw_temp) {
+                                                        // 温度以毫摄氏度为单位，转换为摄氏度
+                                                        float temp_c = raw_temp / 1000.0f;
+                                                        core_temps[label] = temp_c;
+                                                        
+                                                        RCLCPP_DEBUG(this->get_logger(),
+                                                                   "CPU %s : %.1f °C",
+                                                                   label.c_str(), temp_c);
+                                                    }
+                                                }
                                             }
                                         }
-                                    }
-                                    
-                                    if (should_include) {
-                                        valid_temperatures.push_back(temp_celsius);
+                                        label_stream.close();
                                     }
                                 }
-                                temp_stream.close();
                             }
                         }
+                        name_stream.close();
                     }
                 }
             }
         } catch (const std::exception& e) {
-            RCLCPP_WARN(this->get_logger(), "Error reading thermal data: %s", e.what());
+            RCLCPP_WARN(this->get_logger(), "Error reading hwmon coretemp data: %s", e.what());
         }
         
-        // 如果没有找到任何有效温度（可能是包级温度），尝试包含所有温度
-        if (valid_temperatures.empty()) {
-            try {
-                if (fs::exists(thermal_path)) {
-                    for (const auto& entry : fs::directory_iterator(thermal_path)) {
-                        if (entry.is_directory()) {
-                            std::string zone_name = entry.path().filename().string();
+        return core_temps;
+    }
+    
+    // 获取运行中的CPU核心的平均温度（排除低使用率和离线的核心）
+    float get_average_cpu_temperature() {
+        std::vector<float> valid_temperatures;
+        
+        // 首先尝试从 coretemp 驱动读取
+        std::map<std::string, float> core_temps = get_core_temperatures();
+        
+        if (!core_temps.empty()) {
+            // 从核心标签中提取 CPU 编号，进行过滤
+            for (const auto& [label, temp] : core_temps) {
+                // 解析标签，如 "Core 0", "Core 1", 等
+                bool should_include = true;
+                
+                // 如果标签包含 "Core"，则为核心级温度，进行亲和性和使用率检查
+                if (label.find("Core") != std::string::npos) {
+                    try {
+                        // 从标签中提取核心编号（如 "Core 0" -> 0）
+                        size_t space_pos = label.rfind(' ');
+                        if (space_pos != std::string::npos) {
+                            int core_num = std::stoi(label.substr(space_pos + 1));
+                            std::string cpu_name = "cpu" + std::to_string(core_num);
                             
-                            if (zone_name.find("thermal_zone") != std::string::npos) {
-                                std::string temp_file = entry.path().string() + "/temp";
-                                
-                                if (fs::exists(temp_file)) {
-                                    std::ifstream temp_stream(temp_file);
-                                    int32_t temp_raw = 0;
-                                    
-                                    if (temp_stream >> temp_raw) {
-                                        int32_t temp_celsius = temp_raw / 1000;
-                                        valid_temperatures.push_back(temp_celsius);
-                                    }
-                                    temp_stream.close();
+                            // 检查是否在亲和性列表中
+                            if (!is_cpu_allowed(core_num)) {
+                                should_include = false;
+                                RCLCPP_DEBUG(this->get_logger(),
+                                           "Skipping CPU not in affinity list: %s", cpu_name.c_str());
+                            } else {
+                                // 检查 CPU 使用率
+                                double usage = calculate_cpu_usage(cpu_name);
+                                if (usage < cpu_usage_threshold_) {
+                                    should_include = false;
+                                    RCLCPP_DEBUG(this->get_logger(),
+                                               "Skipping low-usage CPU %s (%.1f%%)",
+                                               cpu_name.c_str(), usage);
                                 }
                             }
                         }
+                    } catch (const std::exception& e) {
+                        RCLCPP_DEBUG(this->get_logger(), "Error parsing core label '%s': %s",
+                                    label.c_str(), e.what());
                     }
+                } else if (label.find("Package") != std::string::npos) {
+                    // Package 温度通常是平台级的，不需要过滤
+                    should_include = true;
                 }
-            } catch (...) {
-                // 忽略错误
+                
+                if (should_include) {
+                    valid_temperatures.push_back(temp);
+                }
             }
         }
         
-        // 如果还是没有找到温度信息，尝试从 /proc/cpuinfo 读取（备选方案）
+        // 如果没有找到有效温度，尝试备选方案
         if (valid_temperatures.empty()) {
             valid_temperatures = get_cpu_temperature_from_cpuinfo();
         }
@@ -314,8 +340,8 @@ private:
             float sum = std::accumulate(valid_temperatures.begin(), valid_temperatures.end(), 0.0f);
             float avg_temp = sum / static_cast<float>(valid_temperatures.size());
             
-            RCLCPP_DEBUG(this->get_logger(), 
-                       "Calculated average temperature from %zu cores: %.1f°C", 
+            RCLCPP_DEBUG(this->get_logger(),
+                       "Calculated average temperature from %zu cores: %.1f°C",
                        valid_temperatures.size(), avg_temp);
             
             return avg_temp;
