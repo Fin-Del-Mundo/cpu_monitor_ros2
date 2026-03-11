@@ -31,7 +31,7 @@ ros2 topic hz /x86_temperature            # 发布频率
 | 1秒周期发布 | 固定1秒发送一次温度数据 |
 | **CPU亲和性检查** | 从 `/proc/self/status` 读取 `Cpus_allowed_list`，只计算允许的CPU |
 | 使用率过滤 | 只统计使用率≥5%的核心（排除低负载核心） |
-| 多源温度 | 优先硬件传感器，备选CPU频率推算 |
+| 多源温度 | 优先coretemp驱动，备选CPU频率推算 |
 | 可配置阈值 | 默认5%，可根据需求调整（0%-100%） |
 | float32精度 | 发布浮点温度数据，精度0.1°C |
 
@@ -80,16 +80,33 @@ $$\text{使用率} = \frac{\text{总时间变化} - \text{空闲时间变化}}{\
 
 **精度**：1秒采样周期，每次计算与前一秒的差值
 
-### 3. 温度数据过滤
+### 3. 温度数据获取
+
+**优先数据源 - coretemp驱动**：
+```bash
+/sys/class/hwmon/hwmonX/
+├── name                    # 驱动名称（需为"coretemp"）
+├── temp1_label            # "Core 0"
+├── temp1_input            # 对应温度值（毫摄氏度）
+├── temp2_label            # "Core 1"
+├── temp2_input            # 对应温度值（毫摄氏度）
+└── ...
+```
+
+**工作流程**：
+1. 遍历 `/sys/class/hwmon/hwmon*` 目录
+2. 检查 `name` 文件是否包含 "coretemp" 驱动
+3. 查找所有 `temp*_label` 文件并读取标签（如 "Core 0"）
+4. 将 `_label` 后缀替换为 `_input` 读取温度值
+5. 温度值从毫摄氏度转换为摄氏度（除以1000）
 
 **核心有效性判断**：
 ```
 活跃 = (CPU在亲和列表中) AND (使用率 ≥ 5%)
 ```
 
-**温度来源优先级**：
-1. `/sys/class/thermal/thermal_zoneX/temp` (硬件传感器) → 准确度最高
-2. `/proc/cpuinfo` cpu MHz (频率推算) → 备选方案
+**备选方案**：
+若 coretemp 不可用，回退到 `/proc/cpuinfo` cpu MHz (频率推算)
 
 **最终计算**：
 $$T_{avg} = \frac{\sum_{i \in \text{活跃}} T_i}{n}$$
@@ -117,7 +134,7 @@ $$T_{avg} = \frac{\sum_{i \in \text{活跃}} T_i}{n}$$
 |--------|--------|------|
 | 1 | `/proc/self/status` | 读取进程CPU亲和性列表 |
 | 2 | `/proc/stat` | 计算CPU使用率，过滤低使用率核心 |
-| 3 | `/sys/class/thermal/thermal_zoneX/temp` | 读取硬件温度（毫度→摄氏度） |
+| 3 | `/sys/class/hwmon/hwmonX/temp*_input` | 读取coretemp驱动温度（毫度→摄氏度） |
 | 4 | `/proc/cpuinfo` cpu MHz | 频率推算温度（备选） |
 
 ### 性能特性
@@ -131,11 +148,13 @@ $$T_{avg} = \frac{\sum_{i \in \text{活跃}} T_i}{n}$$
 
 ### 温度读取为0
 
-**原因**：无可用的温度传感器  
+**原因**：无可用的 coretemp 驱动或温度传感器  
 **检查**：
 ```bash
-ls /sys/class/thermal/              # 检查thermal_zone
-cat /proc/cpuinfo | grep "cpu MHz"  # 检查CPU频率
+ls /sys/class/hwmon/                # 检查hwmon设备
+cat /sys/class/hwmon/hwmon*/name    # 检查驱动名称（需为coretemp）
+ls /sys/class/hwmon/hwmonX/temp*    # 查看温度文件
+cat /proc/cpuinfo | grep "cpu MHz"  # 检查CPU频率（备选）
 ```
 
 ### 所有CPU都被过滤
@@ -229,7 +248,7 @@ cpu_monitor/
   1. 更新前一次CPU统计
   2. 读取新的/proc/stat
   3. 计算每个核心使用率
-  4. 遍历所有thermal_zone
+  4. 遍历/sys/class/hwmon/hwmonX找coretemp驱动
   5. 检查：在亲和列表中? ✓ 使用率≥5%? ✓
   6. 收集符合条件的温度
   7. 计算平均值 (float32精度)
